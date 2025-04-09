@@ -1,12 +1,6 @@
 services:
   - type: web
-    name: ytvox-spleeter
-    env: python
-    buildCommand: |
-      echo "python_version = '3.8'" > runtime.txt
-      pip install -r requirements.txt
-    startCommand: ./start.sh
+    name: ytvox-docker-spleeter
+    env: docker
     plan: free
-    envVars:
-      - key: PORT
-        value: 10000
+    dockerfilePath: ./Dockerfile
