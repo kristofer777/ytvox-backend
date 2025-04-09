@@ -2,7 +2,9 @@ services:
   - type: web
     name: ytvox-spleeter
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      echo "python_version = '3.8'" > runtime.txt
+      pip install -r requirements.txt
     startCommand: ./start.sh
     plan: free
     envVars:
