@@ -1,6 +1,30 @@
+# This file configures your service on Render.
+# Place it in the root of your repository.
 services:
-  - type: web
-    name: ytvox-docker-spleeter
-    env: docker
-    plan: free
-    dockerfilePath: ./Dockerfile
+  - type: web # Specifies a web service
+    name: yt-spleeter-api # Choose a name for your service on Render
+    env: docker # Use the Dockerfile in your repository
+    # Ensure this repo URL is correct for your GitHub repository!
+    repo: https://github.com/kristofer777/ytvox-backend.git # <-- CHANGE THIS
+    # Optional: Specify a branch if not using 'main' or 'master'
+    # branch: main
+    # Optional: Specify the path to your Dockerfile if it's not in the root
+    # dockerfilePath: ./Dockerfile
+    healthCheckPath: /health # Use the /health endpoint defined in main.py
+    envVars:
+      - key: PYTHON_VERSION # Inform Render which Python version you intend to use (matches Dockerfile)
+        value: 3.10
+      - key: UVICORN_WORKERS # Control the number of Uvicorn workers
+        value: 1 # Start with 1, increase based on load and instance resources
+    # Define the command Render uses to start your service.
+    # It MUST use $PORT environment variable provided by Render.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers $UVICORN_WORKERS
+    # Spleeter/TensorFlow can be resource-intensive.
+    # The 'Free' plan might be too slow or run out of memory.
+    # Start with 'Starter' or consider 'Standard' if builds/runtime fail.
+    plan: starter # Examples: free, starter, standard, pro, etc.
+    # Optional: Add a Render Disk if you need persistence for downloaded/processed files
+    # disks:
+    #   - name: data # Name of the disk mount
+    #     mountPath: /app/download_data # Mount the disk at the download path
+    #     sizeGB: 5 # Size of the disk in GB
