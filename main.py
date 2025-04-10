@@ -9,7 +9,8 @@ import re
 import shutil
 import subprocess
 import time
-from yt_dlp import YoutubeDL
+# Import YoutubeDL specifically to catch its download errors if needed
+from yt_dlp import YoutubeDL, DownloadError
 from fastapi.staticfiles import StaticFiles
 
 # ---> ADD THIS IMPORT FOR CORS <---
@@ -19,9 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 # ---> ADD CORS MIDDLEWARE CONFIGURATION <---
-# IMPORTANT: Replace 'YOUR_REAL_EXTENSION_ID_HERE' with the actual ID
-#            of your Chrome extension (find it in chrome://extensions/)
-#            The format MUST be exactly "chrome-extension://<ID>"
+# Using the extension ID you provided
 chrome_extension_origin = "chrome-extension://modaahafjnllmkaabcinemclpbbklgnn"
 
 origins = [
@@ -29,7 +28,6 @@ origins = [
     # You can add other origins here if needed, e.g., for local testing:
     # "http://localhost",
     # "http://127.0.0.1",
-    # "http://localhost:8080", # Example if you had a local web UI test page
 ]
 
 app.add_middleware(
@@ -43,11 +41,8 @@ app.add_middleware(
 
 
 # --- Global Variables & Setup ---
-# Use a subdirectory for downloads. Render ephemeral storage or mounted disk.
 DOWNLOADS = Path("./download_data")
-DOWNLOADS.mkdir(exist_ok=True) # Create the directory if it doesn't exist
-
-# In-memory job store (will be lost on server restart unless using persistent storage)
+DOWNLOADS.mkdir(exist_ok=True)
 job_store = {}
 
 # --- Pydantic Models ---
@@ -65,12 +60,13 @@ def start_extraction(request: ExtractRequest):
         "start_time": time.time(),
         "url": request.url,
         "result_url": None,
-        "message": None
+        "message": "Job added to queue." # Initial message
     }
     thread = Thread(target=process_acapella, args=(request.url, job_id))
     thread.start()
     # Return the initial job status along with the ID
-    return job_store[job_id] | {"job_id": job_id} # Python 3.9+ dict merge
+    # ---> MODIFIED THIS LINE for Python < 3.9 compatibility <---
+    return {**job_store[job_id], "job_id": job_id}
 
 @app.get("/progress/{job_id}")
 def get_progress(job_id: str):
@@ -85,9 +81,7 @@ def health_check():
     """Simple health check endpoint for Render."""
     return {"status": "ok"}
 
-# --- Static File Serving (Optional, requires persistent disk on Render) ---
-# Mount the downloads directory to be accessible via /downloads URL path
-# Note: Files are ephemeral unless using Render Disks.
+# --- Static File Serving (Optional) ---
 if DOWNLOADS.is_dir():
     try:
         app.mount("/downloads", StaticFiles(directory=DOWNLOADS), name="downloads")
@@ -101,15 +95,21 @@ else:
 # --- Background Processing Logic ---
 def process_acapella(link, job_id):
     """Downloads audio, runs Spleeter, and cleans up."""
-    output_wav = None # Initialize to None
-    stem_folder_path = None # Initialize to None
+    output_wav = None
+    stem_folder_path = None
     try:
+        # Ensure job exists before proceeding
+        if job_id not in job_store:
+             print(f"Job {job_id}: Aborting processing, job not found in store.")
+             return
+
         job_store[job_id]["status"] = "downloading"
-        job_store[job_id]["progress"] = 5 # Small initial progress
+        job_store[job_id]["progress"] = 5
+        job_store[job_id]["message"] = "Starting download..."
         print(f"Job {job_id}: Starting download for {link}")
 
         ID = uuid4().hex[:6]
-        output_wav = DOWNLOADS / f"track_{ID}.wav" # Define path early for cleanup
+        output_wav = DOWNLOADS / f"track_{ID}.wav"
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -123,26 +123,50 @@ def process_acapella(link, job_id):
             'quiet': True,
             'progress_hooks': [lambda d: update_download_progress(d, job_id)],
             'noplaylist': True,
-            # Consider adding download limits
-            # 'max_filesize': '100m',
-            # 'match_filter': 'duration < 600', # Max 10 minutes
+            # Add options yt-dlp suggests might help with bot detection (no guarantees)
+            'cookiesfrombrowser': ('chrome',), # Tries to use Chrome cookies if available (unlikely on server)
+            'sleep_interval_requests': 1, # Wait 1s between http requests
+            'sleep_interval': 3 # Wait 3s before starting download
         }
 
         title = f"audio_{ID}"
         with YoutubeDL(ydl_opts) as ydl:
             try:
+                # Check job status again before download attempt
+                if job_store.get(job_id, {}).get("status") == "error":
+                    print(f"Job {job_id}: Skipping download, job already marked as error.")
+                    return
                 info = ydl.extract_info(link, download=True)
                 title = info.get('title', f"audio_{ID}")
                 print(f"Job {job_id}: Download finished. Title: {title}")
-            except Exception as ydl_error:
-                print(f"Error during yt-dlp download/extraction for job {job_id}: {ydl_error}")
-                # Provide more specific error if possible
-                error_message = f"yt-dlp failed: {str(ydl_error)[:200]}" # Limit error message length
+            # Catch specific yt-dlp DownloadError
+            except DownloadError as ydl_error:
+                # ---> ADDED PRINT HERE for clearer server log <---
+                print(f"Job {job_id}: yt-dlp DownloadError: {ydl_error}")
+                # Check for common bot detection message
+                if "confirm you.re not a bot" in str(ydl_error).lower():
+                    error_message = "Download failed: Blocked by YouTube verification."
+                else:
+                    error_message = f"Download failed: {str(ydl_error)[:200]}"
+                # Raise a standard error to be caught by the outer handler
                 raise ValueError(error_message)
+            except Exception as ydl_generic_error:
+                 print(f"Job {job_id}: Generic yt-dlp Error: {ydl_generic_error}")
+                 error_message = f"yt-dlp failed unexpectedly: {str(ydl_generic_error)[:200]}"
+                 raise ValueError(error_message)
+
+        # Ensure job still exists and wasn't errored during download hook
+        if job_store.get(job_id, {}).get("status") == "error":
+            print(f"Job {job_id}: Aborting after download attempt, job status is error.")
+            return
+        if not output_wav.exists():
+             print(f"Job {job_id}: Error - Expected WAV file {output_wav} not found after yt-dlp.")
+             raise FileNotFoundError(f"Output WAV {output_wav.name} missing after download attempt.")
 
 
         job_store[job_id]["status"] = "processing"
-        job_store[job_id]["progress"] = 50 # Update progress after download
+        job_store[job_id]["progress"] = 50
+        job_store[job_id]["message"] = "Processing audio..."
 
         clean_title = re.sub(r'[^\w\s().-]', '', title).strip().replace(" ", "_")
         if not clean_title: clean_title = f"audio_{ID}"
@@ -150,7 +174,7 @@ def process_acapella(link, job_id):
         final_output_path = DOWNLOADS / final_output_filename
 
         stem_folder_name = output_wav.stem
-        stem_folder_path = DOWNLOADS / stem_folder_name # Define path early
+        stem_folder_path = DOWNLOADS / stem_folder_name
         expected_vocals_path = stem_folder_path / "vocals.wav"
 
         print(f"Job {job_id}: Running Spleeter on {output_wav}...")
@@ -162,9 +186,13 @@ def process_acapella(link, job_id):
         result = subprocess.run(spleeter_command, capture_output=True, text=True, check=False)
 
         if result.returncode != 0:
-            error_detail = result.stderr[:500].strip() # Get first 500 chars of error
+            error_detail = result.stderr[:500].strip()
             print(f"Spleeter failed for job {job_id}. Code: {result.returncode}. Error: {error_detail}")
-            raise RuntimeError(f"Spleeter processing failed: {error_detail}")
+            # Check common errors
+            if "out of memory" in error_detail.lower() or "killed" in error_detail.lower():
+                 raise MemoryError(f"Spleeter failed: Out of memory. Consider upgrading service plan.")
+            else:
+                 raise RuntimeError(f"Spleeter processing failed: {error_detail}")
 
         print(f"Job {job_id}: Spleeter finished. Checking for {expected_vocals_path}...")
 
@@ -175,30 +203,38 @@ def process_acapella(link, job_id):
         shutil.move(str(expected_vocals_path), final_output_path)
         print(f"Job {job_id}: Vocals moved to {final_output_path}")
 
-        # --- Update job store upon success ---
         job_store[job_id]["progress"] = 100
         job_store[job_id]["status"] = "done"
-        # Provide a relative URL path for downloading (requires StaticFiles mount)
         job_store[job_id]["result_url"] = f"/downloads/{final_output_filename}"
         job_store[job_id]["message"] = "Extraction successful."
         print(f"Job {job_id}: Successfully completed.")
 
     except Exception as e:
-        print(f"Error processing job {job_id}: {e}")
-        if job_id in job_store: # Ensure job still exists
+        error_type = type(e).__name__
+        print(f"Error processing job {job_id} ({error_type}): {e}")
+        if job_id in job_store:
             job_store[job_id]["status"] = "error"
-            # Limit message length for display
-            job_store[job_id]["message"] = str(e)[:500]
-            job_store[job_id]["progress"] = 0 # Reset progress on error
+            # Provide specific message for known recoverable errors
+            if isinstance(e, FileNotFoundError):
+                 job_store[job_id]["message"] = f"Processing error: Intermediate file missing."
+            elif isinstance(e, MemoryError):
+                 job_store[job_id]["message"] = str(e) # Use the specific memory error message
+            elif isinstance(e, ValueError): # Catches our raised yt-dlp errors
+                 job_store[job_id]["message"] = str(e)
+            else: # Generic catch-all
+                 job_store[job_id]["message"] = f"Error ({error_type}): {str(e)[:200]}"
+            job_store[job_id]["progress"] = 0
 
     finally:
         # --- Cleanup ---
         print(f"Job {job_id}: Cleaning up intermediate files...")
         try:
-            if stem_folder_path and stem_folder_path.exists():
+            # Check if stem_folder_path was defined before trying to use it
+            if 'stem_folder_path' in locals() and stem_folder_path is not None and stem_folder_path.exists():
                 shutil.rmtree(stem_folder_path)
                 print(f"Job {job_id}: Removed directory {stem_folder_path}")
-            if output_wav and output_wav.exists():
+            # Check if output_wav was defined before trying to use it
+            if output_wav is not None and output_wav.exists():
                 os.remove(output_wav)
                 print(f"Job {job_id}: Removed file {output_wav}")
         except Exception as cleanup_error:
@@ -207,43 +243,36 @@ def process_acapella(link, job_id):
 
 def update_download_progress(d, job_id):
     """Hook for yt-dlp to update download progress smoothly."""
-    if job_id not in job_store: return # Job might have been cancelled/deleted
+    # Ensure job exists and hasn't already errored out
+    if job_id not in job_store or job_store[job_id].get("status") == "error":
+         return
 
     if d['status'] == 'downloading':
-        job_store[job_id]['status'] = 'downloading'
-        total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-        if total_bytes and total_bytes > 0:
-            # Calculate progress as 5% to 50% range during download
-            download_progress = int((d['downloaded_bytes'] / total_bytes) * 45) # Scale 0-100% to 0-45%
-            job_store[job_id]['progress'] = 5 + download_progress # Add base 5%
-        else:
-             # If no total size, just show small progress
-             job_store[job_id]['progress'] = max(job_store[job_id].get('progress', 5), 10)
+        # Only update if status is still downloading
+        if job_store[job_id]['status'] == 'downloading':
+            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
+            if total_bytes and total_bytes > 0:
+                download_progress = int((d['downloaded_bytes'] / total_bytes) * 45)
+                job_store[job_id]['progress'] = min(5 + download_progress, 49) # Cap below 50
+                job_store[job_id]['message'] = f"Downloading... {job_store[job_id]['progress']}%"
+            else:
+                 job_store[job_id]['progress'] = max(job_store[job_id].get('progress', 5), 10)
+                 job_store[job_id]['message'] = f"Downloading..."
 
     elif d['status'] == 'finished':
-        job_store[job_id]['progress'] = 50 # Mark download phase as complete
-        job_store[job_id]['status'] = 'processing' # Ready for Spleeter
+        if job_store[job_id]['status'] == 'downloading': # Prevent overwrite if already processing
+            job_store[job_id]['progress'] = 50
+            job_store[job_id]['status'] = 'processing'
+            job_store[job_id]['message'] = "Download complete. Processing..."
     elif d['status'] == 'error':
-        job_store[job_id]['status'] = 'error'
-        job_store[job_id]['message'] = 'Download failed via yt-dlp hook'
-        job_store[job_id]['progress'] = 0
-
-
-# --- Optional: Job Cleanup Logic ---
-# (Consider a more robust solution like Redis TTL or scheduled tasks for production)
-# JOB_TTL = 3600 # 1 hour
-
-# def cleanup_old_jobs():
-#     # ... (implementation as before) ...
-# pass # Placeholder if not implementing now
-
-# cleanup_thread = Thread(target=cleanup_old_jobs, daemon=True)
-# cleanup_thread.start()
+        # Don't overwrite a more specific error message potentially set elsewhere
+        if job_store[job_id]['status'] != 'error':
+             job_store[job_id]['status'] = 'error'
+             job_store[job_id]['message'] = 'Download failed (yt-dlp hook).'
+             job_store[job_id]['progress'] = 0
 
 
 # --- Uvicorn Entry Point (for local testing) ---
 if __name__ == "__main__":
     import uvicorn
-    # Run locally using: python main.py
-    # Render uses the startCommand defined in render.yaml or the dashboard
     uvicorn.run(app, host="0.0.0.0", port=8000)
